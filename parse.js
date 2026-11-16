@@ -246,9 +246,11 @@ function backpedal(raw) {
 // After backpedal: if the URL contains '(' but no ')' at all, truncate at
 // the first '('.
 function parenTruncate(url) {
-  if (url.indexOf('(') === -1) return url;
-  if (url.indexOf(')') !== -1) return url;
-  return url.slice(0, url.indexOf('('));
+  const open = url.indexOf('(');
+  if (open === -1) return url;
+  // Truncate at the first '(' that has no ')' after it.
+  if (url.indexOf(')', open + 1) === -1) return url.slice(0, open);
+  return url;
 }
 
 // Extended email match at position i (start of a [\w.+-] run).
@@ -755,6 +757,7 @@ function parseInline(src, refs) {
   const nodes = [];
   const delims = [];
   const brackets = [];
+  let activeBrackets = 0; // count of active (not yet deactivated) brackets
   // Masked positions for emphasis delimiters: from a '<' (next char not a
   // space) to the next '>'. A second '<' before that '>' aborts the mask.
   const masked = new Uint8Array(n);
@@ -943,6 +946,7 @@ function parseInline(src, refs) {
       nodes.push(node);
       lastWasEscape = false;
       brackets.push({ node, srcPos: i, isImage, active: true, delimCount: delims.length });
+      activeBrackets++;
       i += len;
       textStart = i;
       continue;
@@ -955,6 +959,7 @@ function parseInline(src, refs) {
       // later ] (cm-512/528: triple-nested brackets).
       if (brackets.length === 0) { i++; continue; } // literal ]
       const bracket = brackets.pop();
+      if (bracket.active) activeBrackets--;
       if (!bracket.active) { i++; continue; } // literal ]
       // Try inline, reference/collapsed, then shortcut. No shortcut
       // fallback when ( or [ follows (an attempted link form blocks it).
@@ -1034,7 +1039,7 @@ function parseInline(src, refs) {
           if (brackets[b].active) { outerIdx = b; break; }
         }
         for (let b = (outerIdx === -1 ? 0 : outerIdx + 1); b < brackets.length; b++) {
-          brackets[b].active = false;
+          if (brackets[b].active) { brackets[b].active = false; activeBrackets--; }
         }
         i++;
         continue;
@@ -1070,7 +1075,7 @@ function parseInline(src, refs) {
       // if this is a link (images may contain links).
       if (!bracket.isImage) {
         for (let b = 0; b < brackets.length; b++) {
-          if (!brackets[b].isImage) brackets[b].active = false;
+          if (!brackets[b].isImage && brackets[b].active) { brackets[b].active = false; activeBrackets--; }
         }
       }
       if (bracket.isImage) {
@@ -1131,7 +1136,7 @@ function parseInline(src, refs) {
     // (suppressed inside an open [ bracket: marked does not render
     // extended autolinks inside link text, though <...> autolinks do render;
     // also suppressed while an unclosed inline <a> leaks in-link state)
-    if ((c === 'h' || c === 'H' || c === 'f' || c === 'F') && brackets.length === 0 && !inHtmlLink) {
+    if ((c === 'h' || c === 'H' || c === 'f' || c === 'F') && activeBrackets === 0 && !inHtmlLink) {
       const rest = src.slice(i, i + 8).toLowerCase();
       let schemeLen = 0;
       if (rest.startsWith('http://')) schemeLen = 7;
@@ -1156,7 +1161,7 @@ function parseInline(src, refs) {
       // No scheme autolink: fall through to the email check below
       // (an email local part may start with f or h).
     }
-    if (c === 'w' && src.slice(i, i + 4) === 'www.' && brackets.length === 0 && !inHtmlLink) {
+    if (c === 'w' && src.slice(i, i + 4) === 'www.' && activeBrackets === 0 && !inHtmlLink) {
       // preceding-char check
       let ok = false;
       if (i === 0) ok = true;
@@ -1185,7 +1190,7 @@ function parseInline(src, refs) {
       // No www autolink: fall through to the email check below.
     }
     if (((c === 'm' && src.slice(i, i + 7) === 'mailto:') ||
-        (c === 'x' && src.slice(i, i + 5) === 'xmpp:')) && brackets.length === 0 && !inHtmlLink) {
+        (c === 'x' && src.slice(i, i + 5) === 'xmpp:')) && activeBrackets === 0 && !inHtmlLink) {
       const schemeLen = c === 'm' ? 7 : 5;
       const em = matchEmail(src, i + schemeLen);
       if (em && em.end > i + schemeLen) {
@@ -1207,7 +1212,7 @@ function parseInline(src, refs) {
       // No email after the scheme: fall through (no link here).
     }
     // --- email (only at the start of a [\w.+-] run)
-    if ((isWord(c) || c === '.' || c === '+' || c === '-') && brackets.length === 0 && !inHtmlLink) {
+    if ((isWord(c) || c === '.' || c === '+' || c === '-') && activeBrackets === 0 && !inHtmlLink) {
       // At a token boundary (right after a delimiter, code span, link,
       // etc.) the email starts a fresh run even if the previous char is
       // a word char (e.g. `__a@b.com__`).
@@ -1259,6 +1264,9 @@ class Cursor {
     this.absColumn = 0;   // absolute column in the original line (never reset)
     this.tabRemain = 0;   // columns left in a partially-consumed tab
     this.prefix = '';     // spaces from expanded leading tabs
+    this.totalWidth = 0;  // columns consumed by matched containers
+    this.lastWidth = 0;   // columns consumed by the innermost container
+    this.lastIsQuote = false; // innermost matched container is a quote
   }
   peek() {
     if (this.tabRemain > 0) return ' ';
@@ -1292,9 +1300,12 @@ class Cursor {
     for (let k = 0; k < n; k++) this.advance();
   }
   resetColumn() { this.column = 0; }
-  // Expand leading tabs (in the leading whitespace run) to spaces, using
-  // their ABSOLUTE columns. Consumes the whole leading whitespace run
-  // into the prefix.
+  // Expand leading tabs (in the leading whitespace run) to spaces. The
+  // tab column is the absolute column, except when the innermost matched
+  // container is a blockquote: then the widths of all outer containers
+  // are subtracted (a tab after `> > ` expands from column 2, after
+  // `  > ` from 4; inside list items the absolute column applies).
+  // Consumes the whole leading whitespace run into the prefix.
   expandLeadingTabs() {
     if (this.tabRemain > 0) {
       this.prefix += ' '.repeat(this.tabRemain);
@@ -1311,7 +1322,8 @@ class Cursor {
         this.column++;
         this.absColumn++;
       } else if (c === '\t') {
-        const w = 4 - (this.absColumn % 4);
+        const base = this.lastIsQuote ? this.totalWidth - this.lastWidth : 0;
+        const w = 4 - ((this.absColumn - base) % 4);
         this.prefix += ' '.repeat(w);
         this.offset++;
         this.column += w;
@@ -1952,6 +1964,7 @@ function parseBlocks(src, refs) {
       const cont = stack[s];
       if (cont.t === B_LIST) continue;
       if (cont.t === B_QUOTE) {
+        const qBefore = cur.absColumn;
         let skipped = 0;
         while (skipped < 3) {
           const ch = cur.peek();
@@ -1967,11 +1980,18 @@ function parseBlocks(src, refs) {
         cur.advance();
         if (cur.peek() === ' ' || cur.peek() === '\t') cur.advance();
         cur.resetColumn();
+        cur.lastWidth = cur.absColumn - qBefore;
+        cur.totalWidth += cur.lastWidth;
+        cur.lastIsQuote = true;
       } else if (cont.t === B_ITEM) {
         if (cur.isBlank()) continue;
         if (cur.indentColumns() < cont.contentIndent) return null;
+        const iBefore = cur.absColumn;
         cur.advanceBy(cont.contentIndent);
         cur.resetColumn();
+        cur.lastWidth = cur.absColumn - iBefore;
+        cur.totalWidth += cur.lastWidth;
+        cur.lastIsQuote = false;
       }
     }
     cur.expandLeadingTabs();
@@ -2132,6 +2152,9 @@ function parseBlocks(src, refs) {
           cursor.advance();
           if (cursor.peek() === ' ' || cursor.peek() === '\t') cursor.advance();
           cursor.resetColumn();
+          cursor.lastWidth = cursor.absColumn - save.a;
+          cursor.totalWidth += cursor.lastWidth;
+          cursor.lastIsQuote = true;
           matchDepth = s + 1;
         } else {
           cursor.offset = save.o; cursor.column = save.c; cursor.tabRemain = save.t; cursor.prefix = save.p; cursor.absColumn = save.a;
@@ -2141,8 +2164,12 @@ function parseBlocks(src, refs) {
       } else if (cont.t === B_ITEM) {
         if (cursor.isBlank()) { matchDepth = s + 1; continue; }
         if (cursor.indentColumns() >= cont.contentIndent) {
+          const beforeAbs = cursor.absColumn;
           cursor.advanceBy(cont.contentIndent);
           cursor.resetColumn();
+          cursor.lastWidth = cursor.absColumn - beforeAbs;
+          cursor.totalWidth += cursor.lastWidth;
+          cursor.lastIsQuote = false;
           matchDepth = s + 1;
         } else {
           allMatched = false;
