@@ -578,6 +578,50 @@ function parseLinkLabel(src, i) {
   return null;
 }
 
+// Marked's link-label backtick pairing quirk: when marked looks for the
+// ']' closing a link label, it pairs consecutive backtick runs
+// (R1,R2), (R3,R4), ... as code spans. An unpaired leftover run blocks
+// the inline and full-reference link forms unless it ends exactly at the
+// ']' and has length >= 2. Shortcut and collapsed links are unaffected
+// (they use a different rule). Returns true if the label (src between
+// openPos '[' and closePos ']') blocks the link.
+function labelPairingBlocks(src, openPos, closePos) {
+  let runCount = 0;
+  let lastRunEnd = -1, lastRunLen = 0;
+  let i = openPos + 1;
+  while (i < closePos) {
+    const c = src[i];
+    if (c === '\\' && i + 1 < closePos && isPunct(src[i + 1])) { i += 2; continue; }
+    if (c === '`') {
+      let j = i;
+      while (j < closePos && src[j] === '`') j++;
+      runCount++;
+      lastRunEnd = j;
+      lastRunLen = j - i;
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  if (runCount % 2 === 0) return false;
+  return !(lastRunEnd === closePos && lastRunLen >= 2);
+}
+
+// Find the ')' matching the '(' at src[openPos] (balanced parens, no
+// string awareness). Returns the position of the matching ')' or -1.
+function findParenEnd(src, openPos) {
+  let depth = 0;
+  for (let i = openPos; i < src.length; i++) {
+    const c = src[i];
+    if (c === '(') depth++;
+    else if (c === ')') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
 // --- emphasis processing ----------------------------------------------------
 
 // Length of the next `*` run at or after index j in src (0 if none).
@@ -758,6 +802,10 @@ function parseInline(src, refs) {
   const delims = [];
   const brackets = [];
   let activeBrackets = 0; // count of active (not yet deactivated) brackets
+  // Emphasis suppression: after a failed `[...](...)` link, marked renders
+  // the whole span (label + parens) with emphasis disabled. Delimiters
+  // created before this position are inactive.
+  let suppressEmUntil = -1;
   // Masked positions for emphasis delimiters: from a '<' (next char not a
   // space) to the next '>'. A second '<' before that '>' aborts the mask.
   const masked = new Uint8Array(n);
@@ -933,6 +981,8 @@ function parseInline(src, refs) {
       delims.push({ node, ch: c, len: runLen, canOpen, canClose, active: true,
         afterWord: after !== '' && isAlnum(after),
         nextStarLen: nextStarRun(src, j), bottom: delimBottom });
+      // Inside a failed-link span, emphasis delimiters stay literal.
+      if (i < suppressEmUntil) delims[delims.length - 1].active = false;
       i = j;
       textStart = i;
       continue;
@@ -966,8 +1016,11 @@ function parseInline(src, refs) {
       let href = null, title = null, endPos = -1, isRef = false;
       const next = i + 1 < n ? src[i + 1] : '';
       const textStartPos = bracket.srcPos + (bracket.isImage ? 2 : 1);
+      // Marked's backtick-pairing quirk blocks the inline and full-reference
+      // forms for this label (shortcut/collapsed are unaffected).
+      const pairingBlocked = labelPairingBlocks(src, textStartPos - 1, i);
       if (next === '(') {
-        const link = parseInlineLink(src, i + 1);
+        const link = pairingBlocked ? null : parseInlineLink(src, i + 1);
         if (link) {
           href = cleanUrl(link.dest);
           title = link.title;
@@ -985,7 +1038,18 @@ function parseInline(src, refs) {
         }
       } else if (next === '[') {
         const lab = parseLinkLabel(src, i + 1);
-        if (lab) {
+        if (lab && lab.label !== '' && pairingBlocked) {
+          // Full reference blocked by the pairing quirk: fall back to the
+          // shortcut (the link text as the label).
+          const key = foldLabel(src.slice(textStartPos, i));
+          const ref = key !== '' ? refs.get(key) : undefined;
+          if (ref) {
+            href = ref.href;
+            title = ref.title;
+            endPos = i + 1;
+            isRef = true;
+          }
+        } else if (lab) {
           let key;
           if (lab.label === '') {
             key = foldLabel(src.slice(textStartPos, i));
@@ -1022,6 +1086,17 @@ function parseInline(src, refs) {
         }
       }
       if (endPos === -1) {
+        // Failed `[...](...)` with a complete paren group: marked renders
+        // the whole span (label + parens) with emphasis disabled.
+        if (next === '(') {
+          const parenEnd = findParenEnd(src, i + 1);
+          if (parenEnd !== -1) {
+            for (let d = bracket.delimCount; d < delims.length; d++) {
+              delims[d].active = false;
+            }
+            suppressEmUntil = parenEnd;
+          }
+        }
         // The bracket did not form a link: delimiters directly inside it
         // (bottom === this bracket's boundary) may now match outside it
         // (cm-523: `*foo [bar* baz]` forms an em across the failed bracket).
