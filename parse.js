@@ -622,6 +622,146 @@ function findParenEnd(src, openPos) {
   return -1;
 }
 
+// Marked's findClosingBracket: find the ']' closing the bracket at
+// src[openPos] ('['), pairing consecutive backtick runs as code spans
+// (a ']' between a paired run pair is skipped). An unpaired leftover run
+// only lets a ']' through if it ends exactly there and has length >= 2.
+// Returns the position of the closing ']' or -1.
+function findBracketClose(src, openPos) {
+  const n = src.length;
+  let depth = 0;
+  let pendingEnd = -1, pendingLen = 0; // unpaired backtick run, if any
+  let i = openPos + 1;
+  while (i < n) {
+    const c = src[i];
+    if (c === '\\' && i + 1 < n && isPunct(src[i + 1])) { i += 2; continue; }
+    if (c === '`') {
+      let j = i;
+      while (j < n && src[j] === '`') j++;
+      if (pendingEnd === -1) { pendingEnd = j; pendingLen = j - i; }
+      else { pendingEnd = -1; pendingLen = 0; }
+      i = j;
+      continue;
+    }
+    if (c === '[') {
+      if (pendingEnd === -1) depth++;
+      i++;
+      continue;
+    }
+    if (c === ']') {
+      if (pendingEnd !== -1) {
+        // ']' inside a potential code span: look for the partner run.
+        let k = i + 1;
+        while (k < n && src[k] !== '`') k++;
+        if (k < n) { i++; continue; } // partner exists; ']' is inside
+        // No partner: leftover run. Closer only if it ends right here
+        // and has length >= 2.
+        if (pendingEnd === i && pendingLen >= 2 && depth === 0) return i;
+        return -1;
+      }
+      if (depth === 0) return i;
+      depth--;
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return -1;
+}
+
+// Does the bracket form a link? Returns the closing ']' position if so,
+// else -1. Mirrors the ']' handler's decision (pairing rule, inline /
+// full-reference / collapsed / shortcut forms).
+function bracketLinkClose(src, bracket, refs) {
+  // findBracketClose expects the '[' position; for images srcPos is the '!'.
+  const closePos = findBracketClose(src, bracket.srcPos + (bracket.isImage ? 1 : 0));
+  if (closePos === -1) return -1;
+  const textStartPos = bracket.srcPos + (bracket.isImage ? 2 : 1);
+  const pairingBlocked = labelPairingBlocks(src, textStartPos - 1, closePos);
+  const next = closePos + 1 < src.length ? src[closePos + 1] : '';
+  const labelKey = foldLabel(src.slice(textStartPos, closePos));
+  const shortcut = labelKey !== '' && refs.get(labelKey);
+  if (next === '(') {
+    if (!pairingBlocked && parseInlineLink(src, closePos + 1)) return closePos;
+    return shortcut ? closePos : -1;
+  }
+  if (next === '[') {
+    const lab = parseLinkLabel(src, closePos + 1);
+    if (lab && lab.label !== '' && pairingBlocked) {
+      return shortcut ? closePos : -1;
+    }
+    if (lab) {
+      const key = lab.label === '' ? labelKey : foldLabel(lab.label);
+      return (key !== '' && refs.get(key)) ? closePos : -1;
+    }
+    return shortcut ? closePos : -1;
+  }
+  return shortcut ? closePos : -1;
+}
+
+// Global backtick-run pairing (proper code-span matching, by length,
+// left-to-right) across the paragraph. Marked pairs runs including those
+// inside link labels; when a link consumes part of a paired region, the
+// em/strong/del delimiters in the surviving part are still suppressed
+// (they behave as if inside a code span). `exclude` is [start,end]
+// ranges whose backticks do not participate (link destinations / ref
+// labels). `masked` marks positions inside <...> tags (also excluded).
+// Returns [start,end] regions.
+function computeBacktickRegions(src, exclude, masked) {
+  const n = src.length;
+  const runs = [];
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    if (c === '\\' && i + 1 < n && src[i + 1] === '`') {
+      // Escaped backtick run: the first backtick is escaped, so the run
+      // cannot open a code span, but marked's codespan regex still
+      // accepts it as a closer. Record it as closer-only.
+      let j = i + 1;
+      while (j < n && src[j] === '`') j++;
+      let ex = masked[i + 1] === 1;
+      if (!ex) {
+        for (let e = 0; e < exclude.length; e++) {
+          if (i + 1 >= exclude[e][0] && i + 1 < exclude[e][1]) { ex = true; break; }
+        }
+      }
+      if (!ex) runs.push([i + 1, j, true]);
+      i = j;
+      continue;
+    }
+    if (c === '\\' && i + 1 < n && isPunct(src[i + 1])) { i += 2; continue; }
+    if (c === '`') {
+      let j = i;
+      while (j < n && src[j] === '`') j++;
+      let ex = masked[i] === 1;
+      if (!ex) {
+        for (let e = 0; e < exclude.length; e++) {
+          if (i >= exclude[e][0] && i < exclude[e][1]) { ex = true; break; }
+        }
+      }
+      if (!ex) runs.push([i, j, false]);
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  const regions = [];
+  let k = 0;
+  while (k < runs.length) {
+    if (runs[k][2]) { k++; continue; } // escaped run cannot open
+    const len = runs[k][1] - runs[k][0];
+    let j = k + 1;
+    while (j < runs.length && runs[j][1] - runs[j][0] !== len) j++;
+    if (j < runs.length) {
+      regions.push([runs[k][0], runs[j][1]]);
+      k = j + 1;
+    } else {
+      k++;
+    }
+  }
+  return regions;
+}
+
 // --- emphasis processing ----------------------------------------------------
 
 // Length of the next `*` run at or after index j in src (0 if none).
@@ -806,6 +946,12 @@ function parseInline(src, refs) {
   // the whole span (label + parens) with emphasis disabled. Delimiters
   // created before this position are inactive.
   let suppressEmUntil = -1;
+  // Ranges of formed links' tails (destination / ref label): backticks
+  // inside them do not participate in the global backtick pairing.
+  const destRanges = [];
+  // True if a link/image formed whose label contains a backtick (the
+  // global pairing may then shift and suppress emphasis after the link).
+  let backtickLink = false;
   // Masked positions for emphasis delimiters: from a '<' (next char not a
   // space) to the next '>'. A second '<' before that '>' aborts the mask.
   const masked = new Uint8Array(n);
@@ -915,10 +1061,25 @@ function parseInline(src, refs) {
       let j = i;
       while (j < n && src[j] === '`') j++;
       const runLen = j - i;
+      // Inside a bracket that will form a link, the code span cannot cross
+      // the bracket's closing ']' (marked matches the link first, so the
+      // code span is tokenized within the label).
+      let searchEnd = n;
+      if (activeBrackets > 0) {
+        for (let b = brackets.length - 1; b >= 0; b--) {
+          if (brackets[b].active) {
+            if (brackets[b].linkClose === undefined) {
+              brackets[b].linkClose = bracketLinkClose(src, brackets[b], refs);
+            }
+            if (brackets[b].linkClose !== -1) searchEnd = brackets[b].linkClose;
+            break;
+          }
+        }
+      }
       // find a closing run of exactly runLen backticks
       let close = -1;
       let k = j;
-      while (k < n) {
+      while (k < searchEnd) {
         if (src[k] === '`') {
           let m = k;
           while (m < n && src[m] === '`') m++;
@@ -980,7 +1141,7 @@ function parseInline(src, refs) {
       }
       delims.push({ node, ch: c, len: runLen, canOpen, canClose, active: true,
         afterWord: after !== '' && isAlnum(after),
-        nextStarLen: nextStarRun(src, j), bottom: delimBottom });
+        nextStarLen: nextStarRun(src, j), bottom: delimBottom, pos: i });
       // Inside a failed-link span, emphasis delimiters stay literal.
       if (i < suppressEmUntil) delims[delims.length - 1].active = false;
       i = j;
@@ -1119,7 +1280,14 @@ function parseInline(src, refs) {
         i++;
         continue;
       }
-      // A link was found. Extract the link text nodes.
+      // A link was found. Record the tail (destination / ref label) for
+      // the global backtick pairing, and note backticks in the label.
+      if (endPos > i + 1) destRanges.push([i + 1, endPos]);
+      if (!backtickLink) {
+        const bq = src.indexOf('`', textStartPos);
+        if (bq !== -1 && bq < i) backtickLink = true;
+      }
+      // Extract the link text nodes.
       flushText(i);
       const oIdx = nodes.indexOf(bracket.node);
       if (oIdx === -1) { i++; continue; } // bracket node no longer top-level
@@ -1318,6 +1486,23 @@ function parseInline(src, refs) {
     i++;
   }
   flushText(n);
+  // Global backtick pairing suppression: a link whose label contains
+  // backticks shifts the paragraph-wide code-span pairing, and emphasis
+  // inside the shifted regions stays literal in marked. (Delimiters
+  // inside formed link labels were already processed and truncated, so
+  // only post-link delimiters can be affected here.)
+  if (backtickLink) {
+    const regions = computeBacktickRegions(src, destRanges, masked);
+    for (let d = 0; d < delims.length; d++) {
+      if (!delims[d].active) continue;
+      for (let r = 0; r < regions.length; r++) {
+        if (delims[d].pos >= regions[r][0] && delims[d].pos < regions[r][1]) {
+          delims[d].active = false;
+          break;
+        }
+      }
+    }
+  }
   processEmphasis(nodes, delims, -1);
   return nodes;
 }
