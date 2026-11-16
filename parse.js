@@ -2103,18 +2103,36 @@ function parseBlocks(src, refs) {
     const t = tip();
     if (t.t !== B_DOC && t.t !== B_QUOTE && t.t !== B_LIST && t.t !== B_ITEM) return 0;
     const lookahead = [firstLine];
-    for (let k = 1; k < 12 && i + k < lines.length; k++) {
-      const stripped = stripFor(lines[i + k]);
-      if (stripped === null) break;
-      lookahead.push(stripped);
-    }
+    let nextK = 1;
+    const extend = (n) => {
+      let added = 0;
+      for (let c = 0; c < n && i + nextK < lines.length; c++, nextK++) {
+        const stripped = stripFor(lines[i + nextK]);
+        if (stripped === null) return added > 0;
+        lookahead.push(stripped);
+        added++;
+      }
+      return added > 0;
+    };
+    extend(11);
     let totalConsumed = 0;
     for (;;) {
+      // Keep at least 3 lines past the current def start in view, so a
+      // dest/title on the following lines is visible (long def blocks).
+      while (lookahead.length < totalConsumed + 3) {
+        if (!extend(12)) break;
+      }
       const def = parseLinkDef(lookahead.slice(totalConsumed));
       if (!def) break;
       if (!refs.has(def.key)) refs.set(def.key, { href: def.href, title: def.title });
       totalConsumed += def.consumed;
-      if (totalConsumed >= lookahead.length) break;
+      if (totalConsumed >= lookahead.length) {
+        // Consumed everything in view; extend once more to check for a
+        // following def, then stop if nothing new appears.
+        const before = lookahead.length;
+        extend(12);
+        if (lookahead.length === before) break;
+      }
     }
     return totalConsumed;
   };
