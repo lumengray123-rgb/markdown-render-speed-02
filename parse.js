@@ -2546,7 +2546,9 @@ function parseBlocks(src, refs) {
         if (f) {
           const node = addChild(tip(), { t: B_CODE, children: [], fenced: true,
             fenceChar: f.fenceChar, fenceLen: f.fenceLen, info: f.info,
-            fenceIndent: f.indent, lines: [], closed: false });
+            // marked strips the opening fence's indent from content lines
+            // only for backtick fences; tilde fences keep their indent.
+            fenceIndent: f.fenceChar === '~' ? 0 : f.indent, lines: [], closed: false });
           stack.push(node);
           lineDone = true;
           break;
