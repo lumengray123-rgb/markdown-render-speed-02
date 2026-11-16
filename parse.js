@@ -669,12 +669,20 @@ function findBracketClose(src, openPos) {
   return -1;
 }
 
+// Raw closing ']' position for a bracket (cached), or -1 if none.
+// (bracketLinkClose returns the ']' only when the bracket forms a link.)
+function bracketClosePos(src, bracket) {
+  if (bracket.closePos === undefined) {
+    bracket.closePos = findBracketClose(src, bracket.srcPos + (bracket.isImage ? 1 : 0));
+  }
+  return bracket.closePos;
+}
+
 // Does the bracket form a link? Returns the closing ']' position if so,
 // else -1. Mirrors the ']' handler's decision (pairing rule, inline /
 // full-reference / collapsed / shortcut forms).
 function bracketLinkClose(src, bracket, refs) {
-  // findBracketClose expects the '[' position; for images srcPos is the '!'.
-  const closePos = findBracketClose(src, bracket.srcPos + (bracket.isImage ? 1 : 0));
+  const closePos = bracketClosePos(src, bracket);
   if (closePos === -1) return -1;
   const textStartPos = bracket.srcPos + (bracket.isImage ? 2 : 1);
   const pairingBlocked = labelPairingBlocks(src, textStartPos - 1, closePos);
@@ -697,6 +705,19 @@ function bracketLinkClose(src, bracket, refs) {
     return shortcut ? closePos : -1;
   }
   return shortcut ? closePos : -1;
+}
+
+// True if any currently-open bracket will form a link (so an autolink
+// at the current position would be inside link text and must not form).
+function anyBracketWillLink(src, brackets, refs) {
+  for (let b = brackets.length - 1; b >= 0; b--) {
+    if (!brackets[b].active) continue;
+    if (brackets[b].linkClose === undefined) {
+      brackets[b].linkClose = bracketLinkClose(src, brackets[b], refs);
+    }
+    if (brackets[b].linkClose !== -1) return true;
+  }
+  return false;
 }
 
 // Global backtick-run pairing (proper code-span matching, by length,
@@ -969,6 +990,26 @@ function parseInline(src, refs) {
   let lastWasEscape = false;
   const isTokenNode = (node) => node && (node.t === T_CODE || node.t === T_LINK || node.t === T_IMAGE ||
     node.t === T_HTML || node.t === T_EM || node.t === T_STRONG || node.t === T_DEL);
+  // Deactivate open brackets whose closing ']' was consumed by an
+  // autolink spanning [start, end) (marked lets the autolink win, so the
+  // bracket is dead text). Delimiters inside it may then match outside.
+  const deactivateConsumed = (start, end) => {
+    for (let b = 0; b < brackets.length; b++) {
+      if (!brackets[b].active) continue;
+      const cp = bracketClosePos(src, brackets[b]);
+      if (cp !== -1 && cp >= start && cp < end) {
+        brackets[b].active = false;
+        activeBrackets--;
+        let newBottom = -1;
+        for (let b2 = brackets.length - 1; b2 >= 0; b2--) {
+          if (brackets[b2].active) { newBottom = brackets[b2].delimCount - 1; break; }
+        }
+        for (let d = brackets[b].delimCount; d < delims.length; d++) {
+          if (delims[d].bottom === brackets[b].delimCount - 1) delims[d].bottom = newBottom;
+        }
+      }
+    }
+  };
 
   let i = 0;
   let textStart = 0;
@@ -1376,10 +1417,13 @@ function parseInline(src, refs) {
       continue;
     }
     // --- extended autolinks: http/https/ftp, www., mailto:/xmpp:, email
-    // (suppressed inside an open [ bracket: marked does not render
-    // extended autolinks inside link text, though <...> autolinks do render;
-    // also suppressed while an unclosed inline <a> leaks in-link state)
-    if ((c === 'h' || c === 'H' || c === 'f' || c === 'F') && activeBrackets === 0 && !inHtmlLink) {
+    // (suppressed inside a bracket that will form a link: marked does
+    // not render extended autolinks inside link text, though <...>
+    // autolinks do render; if the bracket will NOT form a link, the
+    // autolink renders, and a URL spanning past ']' consumes it.
+    // Also suppressed while an unclosed inline <a> leaks in-link state)
+    if ((c === 'h' || c === 'H' || c === 'f' || c === 'F') &&
+        (activeBrackets === 0 || !anyBracketWillLink(src, brackets, refs)) && !inHtmlLink) {
       const rest = src.slice(i, i + 8).toLowerCase();
       let schemeLen = 0;
       if (rest.startsWith('http://')) schemeLen = 7;
@@ -1395,6 +1439,7 @@ function parseInline(src, refs) {
             flushText(i);
             nodes.push({ t: T_LINK, href, title: undefined, c: [{ t: T_TEXT, s: url, raw: true }] });
             lastWasEscape = false;
+            if (activeBrackets > 0) deactivateConsumed(i, i + url.length);
             i += url.length;
             textStart = i;
             continue;
@@ -1404,7 +1449,8 @@ function parseInline(src, refs) {
       // No scheme autolink: fall through to the email check below
       // (an email local part may start with f or h).
     }
-    if (c === 'w' && src.slice(i, i + 4) === 'www.' && activeBrackets === 0 && !inHtmlLink) {
+    if (c === 'w' && src.slice(i, i + 4) === 'www.' &&
+        (activeBrackets === 0 || !anyBracketWillLink(src, brackets, refs)) && !inHtmlLink) {
       // preceding-char check
       let ok = false;
       if (i === 0) ok = true;
@@ -1424,6 +1470,7 @@ function parseInline(src, refs) {
             flushText(i);
             nodes.push({ t: T_LINK, href, title: undefined, c: [{ t: T_TEXT, s: url, raw: true }] });
             lastWasEscape = false;
+            if (activeBrackets > 0) deactivateConsumed(i, i + url.length);
             i += url.length;
             textStart = i;
             continue;
@@ -1433,7 +1480,8 @@ function parseInline(src, refs) {
       // No www autolink: fall through to the email check below.
     }
     if (((c === 'm' && src.slice(i, i + 7) === 'mailto:') ||
-        (c === 'x' && src.slice(i, i + 5) === 'xmpp:')) && activeBrackets === 0 && !inHtmlLink) {
+        (c === 'x' && src.slice(i, i + 5) === 'xmpp:')) &&
+        (activeBrackets === 0 || !anyBracketWillLink(src, brackets, refs)) && !inHtmlLink) {
       const schemeLen = c === 'm' ? 7 : 5;
       const em = matchEmail(src, i + schemeLen);
       if (em && em.end > i + schemeLen) {
@@ -1448,6 +1496,7 @@ function parseInline(src, refs) {
         const full = src.slice(i, end);
         nodes.push({ t: T_LINK, href: cleanUrlBlind(full), title: undefined, c: [{ t: T_TEXT, s: full, raw: true }] });
         lastWasEscape = false;
+        if (activeBrackets > 0) deactivateConsumed(i, end);
         i = end;
         textStart = i;
         continue;
@@ -1455,7 +1504,8 @@ function parseInline(src, refs) {
       // No email after the scheme: fall through (no link here).
     }
     // --- email (only at the start of a [\w.+-] run)
-    if ((isWord(c) || c === '.' || c === '+' || c === '-') && activeBrackets === 0 && !inHtmlLink) {
+    if ((isWord(c) || c === '.' || c === '+' || c === '-') &&
+        (activeBrackets === 0 || !anyBracketWillLink(src, brackets, refs)) && !inHtmlLink) {
       // At a token boundary (right after a delimiter, code span, link,
       // etc.) the email starts a fresh run even if the previous char is
       // a word char (e.g. `__a@b.com__`).
@@ -1475,6 +1525,7 @@ function parseInline(src, refs) {
           flushText(i);
           nodes.push({ t: T_LINK, href: cleanUrlBlind('mailto:' + em.email), title: undefined, c: [{ t: T_TEXT, s: em.email, raw: true }] });
           lastWasEscape = false;
+          if (activeBrackets > 0) deactivateConsumed(i, em.end);
           i = em.end;
           textStart = i;
           continue;
