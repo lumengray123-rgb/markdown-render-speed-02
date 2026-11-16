@@ -2230,18 +2230,25 @@ function parseBlocks(src, refs) {
         // more columns if the remainder is still indented 4+. Only
         // spaces are stripped (tabs were already expanded).
         const cont = t.t === B_PARA ? t.parent : t;
-        const stripSpaces = (s, n) => {
-          let k = 0;
-          while (k < n && k < s.length && s[k] === ' ') k++;
-          return s.slice(k);
-        };
         if (cont && cont.t === B_QUOTE) {
-          content = stripSpaces(content, 4);
-        } else if (cont && cont.t === B_ITEM) {
-          content = stripSpaces(content, cont.contentIndent);
+          // Strip 4 only if the line has at least 4 leading spaces.
           let sp = 0;
           while (sp < content.length && content[sp] === ' ') sp++;
           if (sp >= 4) content = content.slice(4);
+        } else if (cont && cont.t === B_ITEM) {
+          // If the line reaches the content indent, strip it (then 4
+          // more if the remainder has 4+). Otherwise, if it has 4+
+          // leading spaces, strip 4. Otherwise strip nothing.
+          let sp = 0;
+          while (sp < content.length && content[sp] === ' ') sp++;
+          if (sp >= cont.contentIndent) {
+            content = content.slice(cont.contentIndent);
+            sp = 0;
+            while (sp < content.length && content[sp] === ' ') sp++;
+            if (sp >= 4) content = content.slice(4);
+          } else if (sp >= 4) {
+            content = content.slice(4);
+          }
         }
         if (t.t === B_PARA) {
           // Lazy lines never convert to setext/table. A lazy setext
