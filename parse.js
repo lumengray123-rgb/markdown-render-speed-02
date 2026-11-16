@@ -734,13 +734,16 @@ function parseInline(src, refs) {
   const delims = [];
   const brackets = [];
   // Masked positions for emphasis delimiters: from a '<' (next char not a
-  // space) to the next '>'.
+  // space) to the next '>'. A second '<' before that '>' aborts the mask.
   const masked = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
     if (src[i] === '<' && i + 1 < n && src[i + 1] !== ' ') {
       const gt = src.indexOf('>', i + 1);
       if (gt !== -1) {
-        for (let k = i + 1; k < gt; k++) masked[k] = 1;
+        const lt2 = src.indexOf('<', i + 1);
+        if (lt2 === -1 || lt2 > gt) {
+          for (let k = i + 1; k < gt; k++) masked[k] = 1;
+        }
       }
     }
   }
@@ -1267,14 +1270,6 @@ class Cursor {
     for (let k = 0; k < n; k++) this.advance();
   }
   resetColumn() { this.column = 0; }
-  // After a list-item match, the tab column restarts at the item's
-  // content start (a tab after `>` inside an item expands from the
-  // item-relative column) — unless a tab was partially consumed by the
-  // match, in which case absolute columns still apply.
-  resetColumnAbs() {
-    this.column = 0;
-    if (this.tabRemain === 0) this.absColumn = 0;
-  }
   // Expand leading tabs (in the leading whitespace run) to spaces, using
   // their ABSOLUTE columns. Consumes the whole leading whitespace run
   // into the prefix.
