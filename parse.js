@@ -645,10 +645,32 @@ function processEmphasis(nodes, delims, bottom) {
     cNode.s = cNode.s.slice(use);
     const children = nodes.slice(oIdx + 1, cIdx);
     const emNode = { t: closer.ch === '~' ? T_DEL : (use === 2 ? T_STRONG : T_EM), c: children };
+    // Marked quirk: a leftover closer run goes INSIDE the em/strong when
+    // the last inner em/strong is followed only by non-space text
+    // (`**a *b*c***` -> `<strong>a <em>b</em>c*</strong>`; but
+    // `**a *b* c***` and `**a *b****` keep the leftover outside).
+    let leftoverInside = false;
+    if (cNode.s.length > 0 && closer.ch !== '~' && use === 2) {
+      let lastEmIdx = -1;
+      for (let k = children.length - 1; k >= 0; k--) {
+        if (children[k].t === T_EM || children[k].t === T_STRONG || children[k].t === T_DEL) { lastEmIdx = k; break; }
+      }
+      if (lastEmIdx !== -1 && lastEmIdx < children.length - 1) {
+        let ok = true;
+        for (let k = lastEmIdx + 1; k < children.length; k++) {
+          if (children[k].t !== T_TEXT || /\s/.test(children[k].s)) { ok = false; break; }
+        }
+        leftoverInside = ok;
+      }
+    }
+    if (leftoverInside) {
+      emNode.c.push(cNode);
+      closer.active = false;
+    }
     const replacement = [];
     if (oNode.s.length > 0) replacement.push(oNode);
     replacement.push(emNode);
-    if (cNode.s.length > 0) replacement.push(cNode);
+    if (cNode.s.length > 0 && !leftoverInside) replacement.push(cNode);
     nodes.splice(oIdx, cIdx - oIdx + 1, ...replacement);
     // Delimiters between the opener and closer are now inside the em node
     // and can no longer match outside it.
