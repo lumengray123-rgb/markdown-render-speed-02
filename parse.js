@@ -229,22 +229,22 @@ function backpedal(raw) {
     }
     // (2) trailing punctuation ? ! . , : ; * _ ~ ' "
     if ('?!.,:;*_~\'"'.indexOf(last) !== -1) { url = url.slice(0, -1); continue; }
-    // (3) trailing ')' with more ')' than '(' in the URL
+    // (3) trailing ')': strip while there is more than one ')' after
+    // the last '(' (or any ')' at all when there is no '(').
     if (last === ')') {
-      let opens = 0, closes = 0;
-      for (let k = 0; k < url.length; k++) {
-        if (url[k] === '(') opens++;
-        else if (url[k] === ')') closes++;
-      }
-      if (closes > opens) { url = url.slice(0, -1); continue; }
+      const lastOpen = url.lastIndexOf('(');
+      if (lastOpen === -1) { url = url.slice(0, -1); continue; }
+      let closesAfter = 0;
+      for (let k = lastOpen + 1; k < url.length; k++) if (url[k] === ')') closesAfter++;
+      if (closesAfter > 1) { url = url.slice(0, -1); continue; }
       return url;
     }
     return url;
   }
 }
 
-// After backpedal: if the URL contains '(' but no ')' at all, truncate at
-// the first '('.
+// Truncate at the first '(' that has no ')' after it. Runs BEFORE
+// backpedal, so a balancing ')' is not stripped first.
 function parenTruncate(url) {
   const open = url.indexOf('(');
   if (open === -1) return url;
@@ -1145,7 +1145,7 @@ function parseInline(src, refs) {
       if (schemeLen > 0) {
         let j = i + schemeLen;
         while (j < n && !isWS(src[j]) && src[j] !== '<') j++;
-        let url = parenTruncate(backpedal(src.slice(i, j)));
+        let url = backpedal(parenTruncate(src.slice(i, j)));
         if (url.length > schemeLen) {
           const href = cleanUrlBlind(url);
           if (href !== null) {
@@ -1174,7 +1174,7 @@ function parseInline(src, refs) {
       if (ok) {
         let j = i;
         while (j < n && !isWS(src[j]) && src[j] !== '<') j++;
-        let url = parenTruncate(backpedal(src.slice(i, j)));
+        let url = backpedal(parenTruncate(src.slice(i, j)));
         if (url.length > 4) {
           const href = cleanUrlBlind('http://' + url);
           if (href !== null) {
