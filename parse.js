@@ -2382,7 +2382,8 @@ function parseBlocks(src, refs) {
     }
     if (tip().t === B_HTML) {
       const h = tip();
-      h.lines.push(content);
+      // HTML block lines keep raw tabs at top level (like fenced code).
+      h.lines.push(codeContent);
       let ended = false;
       if (h.htmlType === 1) {
         if (content.toLowerCase().indexOf('</' + h.tag + '>') !== -1) ended = true;
